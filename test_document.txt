@@ -1,1 +1,0 @@
-NotebookLM is a fantastic tool for analyzing documents. It was created by Google. It uses Retrieval Augmented Generation.
