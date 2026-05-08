@@ -27,7 +27,7 @@ export function SourceCard({ pageNumber, content, relevanceScore }: SourceCardPr
       </div>
       
       <p className="text-xs text-muted-foreground leading-relaxed line-clamp-4">
-        "{content.trim()}"
+        &quot;{content.trim()}&quot;
       </p>
     </div>
   );

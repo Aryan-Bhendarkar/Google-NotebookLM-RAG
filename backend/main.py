@@ -40,6 +40,8 @@ async def upload_document(file: UploadFile = File(...)):
     
     try:
         file_bytes = await file.read()
+        if len(file_bytes) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large. Maximum size is 10MB.")
         result = await ingest_document(file_bytes, file.filename, file_type)
         logger.info(f"Ingested doc: {result['document_id']}")
         return result

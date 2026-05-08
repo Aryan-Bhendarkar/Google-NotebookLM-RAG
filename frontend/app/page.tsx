@@ -16,10 +16,10 @@ export default function Home() {
   const [activeDoc, setActiveDoc] = useState<DocumentInfo | null>(null);
 
   return (
-    <main className="flex flex-col min-h-screen relative overflow-hidden">
+    <main className="flex flex-col min-h-screen relative overflow-hidden bg-background">
       {/* Decorative background elements */}
-      <div className="absolute top-0 left-1/4 w-[500px] h-[500px] bg-primary/20 rounded-full blur-[120px] pointer-events-none -translate-y-1/2 opacity-50" />
-      <div className="absolute bottom-0 right-1/4 w-[600px] h-[600px] bg-blue-600/10 rounded-full blur-[150px] pointer-events-none translate-y-1/3 opacity-30" />
+      <div className="absolute top-0 left-1/4 w-100 h-100 bg-white/5 rounded-full blur-[60px] pointer-events-none -translate-y-1/2 opacity-30" />
+      <div className="absolute bottom-0 right-1/4 w-100 h-100 bg-white/5 rounded-full blur-[80px] pointer-events-none translate-y-1/3 opacity-20" />
       
       <Header />
 

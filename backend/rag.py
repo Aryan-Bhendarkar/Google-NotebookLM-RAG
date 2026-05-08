@@ -1,9 +1,11 @@
 import os
 import uuid
+import asyncio
 import tempfile
 import logging
 
 from dotenv import load_dotenv
+from pydantic import SecretStr
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -27,15 +29,15 @@ def get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
 
 def get_embeddings() -> GoogleGenerativeAIEmbeddings:
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=os.getenv("GOOGLE_API_KEY"))
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
 
 def get_llm(stream: bool = False) -> ChatOpenAI:
     return ChatOpenAI(
         model=LLM_MODEL,
-        openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-        openai_api_base=OPENROUTER_BASE_URL,
+        api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
+        base_url=OPENROUTER_BASE_URL,
         temperature=0.3,
-        max_tokens=2048,
+        max_completion_tokens=2048,
         streaming=stream,
     )
 
@@ -78,11 +80,14 @@ def chunk_document(pages: list[dict]) -> list[dict]:
     return chunks
 
 async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> dict:
-    pages = extract_text_from_pdf(file_bytes) if file_type == "pdf" else extract_text_from_txt(file_bytes)
+    loop = asyncio.get_event_loop()
+
+    extract_fn = extract_text_from_pdf if file_type == "pdf" else extract_text_from_txt
+    pages = await loop.run_in_executor(None, extract_fn, file_bytes)
     if not pages:
         raise ValueError("No text could be extracted from the document.")
 
-    chunks = chunk_document(pages)
+    chunks = await loop.run_in_executor(None, chunk_document, pages)
     if not chunks:
         raise ValueError("Document produced no chunks after splitting.")
 
@@ -90,23 +95,35 @@ async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> d
     collection_name = f"doc_{document_id}"
 
     qdrant = get_qdrant_client()
-    qdrant.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=EMBEDDING_DIMENSIONS, distance=Distance.COSINE),
-    )
+    try:
+        qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=EMBEDDING_DIMENSIONS, distance=Distance.COSINE),
+        )
+    except Exception as e:
+        if "already exists" not in str(e).lower():
+            raise
 
     texts = [c["text"] for c in chunks]
     metadatas = [{**c["metadata"], "filename": filename, "document_id": document_id} for c in chunks]
 
-    QdrantVectorStore.from_texts(
-        texts=texts,
-        embedding=get_embeddings(),
-        collection_name=collection_name,
-        url=os.getenv("QDRANT_URL"),
-        api_key=os.getenv("QDRANT_API_KEY"),
-        metadatas=metadatas,
-    )
+    qdrant_url = os.getenv("QDRANT_URL")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    embeddings = get_embeddings()
 
+    def _store_vectors():
+        QdrantVectorStore.from_texts(
+            texts=texts,
+            embedding=embeddings,
+            collection_name=collection_name,
+            url=qdrant_url,
+            api_key=qdrant_api_key,
+            metadatas=metadatas,
+        )
+
+    await loop.run_in_executor(None, _store_vectors)
+
+    logger.info(f"Ingestion complete: {document_id}, {len(chunks)} chunks, {len(pages)} pages")
     return {
         "document_id": document_id,
         "collection_name": collection_name,
