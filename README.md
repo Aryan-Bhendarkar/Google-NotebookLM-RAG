@@ -1,65 +1,57 @@
-# NotebookLM Clone (Free Tier Architecture)
+# NotebookLM Clone
 
-A Retrieval-Augmented Generation (RAG) powered web application that allows users to upload documents (PDF/TXT) and chat with them based strictly on their content.
-
-This project employs a 100% free-tier architecture to replicate Google's NotebookLM functionality locally.
-
-## Project Structure
-
-`
-├── backend/                  # Python FastAPI Server
-│   ├── main.py               # REST API endpoints (Upload, Chat)
-│   ├── rag.py                # Core RAG logic (LangChain, Qdrant, OpenRouter)
-│   └── requirements.txt      # Python dependencies
-├── frontend/                 # Next.js 16 React Client
-│   ├── app/                  # Next.js App Router (layout, frontend pages)
-│   ├── components/           # Reusable UI components (shadcn/ui, Chat, FileUpload)
-│   └── package.json          # Node dependencies
-└── README.md                 # Project Overview
-`
+A RAG web app — upload a PDF or TXT document and chat with it using AI. Built on free-tier services.
 
 ## Tech Stack
 
-### Frontend
-- **Framework:** Next.js 15+ (App Router)
-- **Styling/UI:** Tailwind CSS v4, shadcn/ui, Framer Motion
-- **Language:** TypeScript
+| Layer      | Technology                                           |
+| ---------- | ---------------------------------------------------- |
+| Frontend   | Next.js 16, React 19, Tailwind CSS v4, TypeScript    |
+| Backend    | Python 3.11+, FastAPI, LangChain                     |
+| Embeddings | Google Gemini `models/gemini-embedding-2` (3072-dim) |
+| LLM        | OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`  |
+| Vector DB  | Qdrant Cloud                                         |
+| PDF        | pdfplumber + Gemini Vision OCR fallback              |
+
+## Features
+
+- Upload PDF or TXT (up to 10 MB)
+- Full document extraction with OCR fallback for scanned pages
+- Inline page citations `[Page N]` in every answer
+- Streaming responses with source cards in the sidebar
+
+## Setup
 
 ### Backend
-- **Framework:** Python FastAPI
-- **RAG Orchestration:** LangChain
-- **Embeddings:** Google Gemini (gemini-embedding-2) - *Free Tier*
-- **LLM Provider:** OpenRouter (
-vidia/nemotron-3-super-120b-a12b:free) - *Free Tier*
-- **Vector Database:** Qdrant Cloud - *Free Tier*
 
-## Setup Instructions
+```bash
+cd backend
+python -m venv .venv && .venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+cp .env.example .env   # fill in your API keys
+uvicorn main:app --reload
+```
 
-### 1. Backend Setup
-1. Claim an [OpenRouter API Key](https://openrouter.ai/keys)
-2. Claim a [Google Gemini API Key](https://aistudio.google.com/app/apikey)
-3. Claim a [Qdrant Cloud URL and API Key](https://cloud.qdrant.io/)
-4. Navigate to ackend/ and configure environment variables in .env:
-   `nv
-   GOOGLE_API_KEY="your_google_key"
-   OPENROUTER_API_KEY="your_openrouter_key"
-   QDRANT_URL="your_qdrant_url"
-   QDRANT_API_KEY="your_qdrant_api_key"
-   `
-5. Install dependencies and run:
-   `ash
-   cd backend
-   python -m venv venv
-   source venv/Scripts/activate  # On Windows
-   pip install -r requirements.txt
-   uvicorn main:app --reload
-   `
+### Frontend
 
-### 2. Frontend Setup
-`ash
+```bash
 cd frontend
 npm install
 npm run dev
-`
+```
 
-The application will be accessible at http://localhost:3000.
+App runs at `http://localhost:3000`, API at `http://localhost:8000`.
+
+## Environment Variables
+
+Copy `backend/.env.example` to `backend/.env` and fill in:
+
+- `GOOGLE_API_KEY` — [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+- `OPENROUTER_API_KEY` — [openrouter.ai/keys](https://openrouter.ai/keys)
+- `QDRANT_URL` and `QDRANT_API_KEY` — [cloud.qdrant.io](https://cloud.qdrant.io)
+
+## Deployment
+
+**Backend → Render:** connect repo, Render reads `render.yaml` automatically, add the four env vars above.
+
+**Frontend → Vercel:** set root directory to `frontend`, add env var `NEXT_PUBLIC_API_URL=<your Render URL>`.

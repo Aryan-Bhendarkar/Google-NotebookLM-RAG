@@ -1,2 +1,18 @@
+# Python
 backend/.env
-__pycache__/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/.venv/
+.venv/
+*.egg-info/
+
+# Node / Next.js
+frontend/.env.local
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+
+# Misc
+.DS_Store
+*.log
