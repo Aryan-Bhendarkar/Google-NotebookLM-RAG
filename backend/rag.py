@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 400
-EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_MODEL = "models/embedding-001"
 EMBEDDING_DIMENSIONS = 768
 LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -47,12 +47,17 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
-    response = get_gemini_client().models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=texts,
-        config=google_types.EmbedContentConfig(task_type=task_type),
-    )
-    return [list(e.values) for e in response.embeddings]
+    client = get_gemini_client()
+    vectors = []
+    for text in texts:
+        response = client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=text,
+            config=google_types.EmbedContentConfig(task_type=task_type),
+        )
+        values = response.embeddings[0].values if response.embeddings else []
+        vectors.append(list(values or []))
+    return vectors
 
 
 def get_llm(stream: bool = False) -> ChatOpenAI:
@@ -280,18 +285,18 @@ async def retrieve_and_generate(query: str, collection_name: str, stream: bool =
 
     query_vector = embed_texts([query], "RETRIEVAL_QUERY")[0]
 
-    results = qdrant.search(
+    search_result = qdrant.query_points(
         collection_name=collection_name,
-        query_vector=query_vector,
+        query=query_vector,
         limit=TOP_K,
         with_payload=True,
     )
 
     context_parts = []
     sources = []
-    for result in results:
-        page_num = result.payload.get("page_number", "?")
-        content = result.payload.get("page_content", "")
+    for result in search_result.points:
+        page_num = (result.payload or {}).get("page_number", "?")
+        content = (result.payload or {}).get("page_content", "")
         context_parts.append(f"[Page {page_num}]\n{content}")
         sources.append({
             "page_number": page_num,
