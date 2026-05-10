@@ -7,7 +7,5 @@ pypdfium2
 google-genai
 langchain-core
 langchain-text-splitters
-langchain-google-genai
 langchain-openai
-langchain-qdrant
 qdrant-client

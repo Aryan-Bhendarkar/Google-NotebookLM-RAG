@@ -15,11 +15,9 @@ from google.genai import types as google_types
 from dotenv import load_dotenv
 from pydantic import SecretStr
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_openai import ChatOpenAI
-from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -31,18 +29,21 @@ EMBEDDING_DIMENSIONS = 3072
 LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 TOP_K = 10
+EMBED_BATCH = 5
 
 
 def get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
 
 
-def get_doc_embeddings() -> GoogleGenerativeAIEmbeddings:
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, task_type="retrieval_document")
-
-
-def get_query_embeddings() -> GoogleGenerativeAIEmbeddings:
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, task_type="retrieval_query")
+def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
+    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+        config=google_types.EmbedContentConfig(task_type=task_type),
+    )
+    return [list(e.values) for e in response.embeddings]
 
 
 def get_llm(stream: bool = False) -> ChatOpenAI:
@@ -71,7 +72,6 @@ def clean_text(text: str) -> str:
 
 
 def _render_page_as_png(pdf_path: str, page_index: int) -> bytes:
-    """Render a single PDF page to a PNG image at 2x scale."""
     doc = pypdfium2.PdfDocument(pdf_path)  # type: ignore[attr-defined]
     try:
         page = doc[page_index]
@@ -85,7 +85,6 @@ def _render_page_as_png(pdf_path: str, page_index: int) -> bytes:
 
 
 def _ocr_page_with_gemini(image_bytes: bytes) -> str:
-    """Send a page image to Gemini Vision and return extracted text."""
     client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
     response = client.models.generate_content(
         model="gemini-2.0-flash",
@@ -118,10 +117,8 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
             ocr_count = 0
 
             for i, page in enumerate(pdf.pages):
-                # --- attempt 1: pdfplumber direct extraction ---
                 text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
 
-                # Append any tables as pipe-separated rows
                 for table in (page.extract_tables() or []):
                     rows = [
                         " | ".join(cell or "" for cell in row)
@@ -132,12 +129,11 @@ def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
 
                 text = clean_text(text)
 
-                # --- attempt 2: Gemini Vision OCR for image/scanned pages ---
                 if not text:
                     try:
                         logger.info(f"Page {i + 1}/{total}: no selectable text — running Gemini OCR")
-                        image_bytes = _render_page_as_png(tmp_path, i)
-                        text = clean_text(_ocr_page_with_gemini(image_bytes))
+                        image_bytes_page = _render_page_as_png(tmp_path, i)
+                        text = clean_text(_ocr_page_with_gemini(image_bytes_page))
                         if text:
                             ocr_count += 1
                     except Exception as e:
@@ -203,16 +199,7 @@ async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> d
     texts = [c["text"] for c in chunks]
     metadatas = [{**c["metadata"], "filename": filename, "document_id": document_id} for c in chunks]
 
-    embeddings = get_doc_embeddings()
-
-    EMBED_BATCH = 5  # small batches to stay within Gemini free-tier rate limits
-
     def _store_vectors():
-        vector_store = QdrantVectorStore(
-            client=qdrant,
-            collection_name=collection_name,
-            embedding=embeddings,
-        )
         total = len(texts)
         for start in range(0, total, EMBED_BATCH):
             end = min(start + EMBED_BATCH, total)
@@ -221,7 +208,16 @@ async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> d
 
             for attempt in range(3):
                 try:
-                    vector_store.add_texts(texts=batch_texts, metadatas=batch_metas)
+                    vectors = embed_texts(batch_texts, "RETRIEVAL_DOCUMENT")
+                    points = [
+                        PointStruct(
+                            id=str(uuid.uuid4()),
+                            vector=vector,
+                            payload={"page_content": text, **meta},
+                        )
+                        for text, meta, vector in zip(batch_texts, batch_metas, vectors)
+                    ]
+                    qdrant.upsert(collection_name=collection_name, points=points)
                     logger.info(f"Embedded chunks {start + 1}–{end}/{total}")
                     break
                 except Exception as e:
@@ -232,7 +228,6 @@ async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> d
                     else:
                         raise
 
-            # brief pause between batches to respect Gemini RPM limits
             if end < total:
                 time.sleep(1)
 
@@ -273,24 +268,27 @@ If the information is not present in the context above, respond with exactly:
 
 
 async def retrieve_and_generate(query: str, collection_name: str, stream: bool = True):
-    vector_store = QdrantVectorStore.from_existing_collection(
-        embedding=get_query_embeddings(),
-        collection_name=collection_name,
-        url=os.getenv("QDRANT_URL"),
-        api_key=os.getenv("QDRANT_API_KEY"),
-    )
+    qdrant = get_qdrant_client()
 
-    results = vector_store.similarity_search_with_score(query, k=TOP_K)
+    query_vector = embed_texts([query], "RETRIEVAL_QUERY")[0]
+
+    results = qdrant.search(
+        collection_name=collection_name,
+        query_vector=query_vector,
+        limit=TOP_K,
+        with_payload=True,
+    )
 
     context_parts = []
     sources = []
-    for doc, score in results:
-        page_num = doc.metadata.get("page_number", "?")
-        context_parts.append(f"[Page {page_num}]\n{doc.page_content}")
+    for result in results:
+        page_num = result.payload.get("page_number", "?")
+        content = result.payload.get("page_content", "")
+        context_parts.append(f"[Page {page_num}]\n{content}")
         sources.append({
             "page_number": page_num,
-            "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-            "relevance_score": round(float(score), 4),
+            "content": content[:200] + "..." if len(content) > 200 else content,
+            "relevance_score": round(float(result.score), 4),
         })
 
     messages = [
@@ -300,7 +298,6 @@ async def retrieve_and_generate(query: str, collection_name: str, stream: bool =
 
     if stream:
         async def generate():
-            # First line: sources metadata
             yield json.dumps({"t": "sources", "d": sources}) + "\n"
             try:
                 async for chunk in get_llm(stream=True).astream(messages):
