@@ -24,7 +24,8 @@ export function FileUpload({ onUploadSuccess }: FileUploadProps) {
     formData.append("file", file);
 
     try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/upload`, {
+      const base = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+      const response = await fetch(`${base}/upload`, {
         method: "POST",
         body: formData,
       });
