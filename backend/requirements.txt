@@ -1,11 +1,10 @@
-fastapi[standard]
-uvicorn[standard]
+fastapi
+uvicorn
 python-dotenv
 python-multipart
-pypdf
 pdfplumber
+pypdfium2
 google-genai
-langchain
 langchain-core
 langchain-text-splitters
 langchain-google-genai
