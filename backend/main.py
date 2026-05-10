@@ -67,7 +67,7 @@ async def chat_with_document(request: ChatRequest):
             async def generate():
                 async for chunk in result():
                     yield chunk
-            return StreamingResponse(generate(), media_type="text/plain")
+            return StreamingResponse(generate(), media_type="application/x-ndjson")
             
         return {"answer": result, "sources": sources}
             

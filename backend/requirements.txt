@@ -3,6 +3,8 @@ uvicorn[standard]
 python-dotenv
 python-multipart
 pypdf
+pdfplumber
+google-genai
 langchain
 langchain-core
 langchain-text-splitters

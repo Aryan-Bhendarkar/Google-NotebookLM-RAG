@@ -1,12 +1,19 @@
 import os
+import io
+import re
+import json
 import uuid
+import time
 import asyncio
 import tempfile
 import logging
 
+import pdfplumber
+import pypdfium2
+from google import genai as google_genai
+from google.genai import types as google_types
 from dotenv import load_dotenv
 from pydantic import SecretStr
-from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_openai import ChatOpenAI
@@ -17,22 +24,29 @@ from qdrant_client.models import Distance, VectorParams
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 400
 EMBEDDING_MODEL = "models/gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 3072
 LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-TOP_K = 5
+TOP_K = 10
+
 
 def get_qdrant_client() -> QdrantClient:
     return QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
 
-def get_embeddings() -> GoogleGenerativeAIEmbeddings:
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL)
+
+def get_doc_embeddings() -> GoogleGenerativeAIEmbeddings:
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, task_type="retrieval_document")
+
+
+def get_query_embeddings() -> GoogleGenerativeAIEmbeddings:
+    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, task_type="retrieval_query")
+
 
 def get_llm(stream: bool = False) -> ChatOpenAI:
-    return ChatOpenAI(
+    return ChatOpenAI(  # type: ignore[call-arg]
         model=LLM_MODEL,
         api_key=SecretStr(os.getenv("OPENROUTER_API_KEY") or ""),
         base_url=OPENROUTER_BASE_URL,
@@ -41,6 +55,7 @@ def get_llm(stream: bool = False) -> ChatOpenAI:
         streaming=stream,
     )
 
+
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,
@@ -48,24 +63,104 @@ text_splitter = RecursiveCharacterTextSplitter(
     length_function=len,
 )
 
+
+def clean_text(text: str) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def _render_page_as_png(pdf_path: str, page_index: int) -> bytes:
+    """Render a single PDF page to a PNG image at 2x scale."""
+    doc = pypdfium2.PdfDocument(pdf_path)  # type: ignore[attr-defined]
+    try:
+        page = doc[page_index]
+        bitmap = page.render(scale=2.0)
+        pil_image = bitmap.to_pil()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return buf.getvalue()
+    finally:
+        doc.close()
+
+
+def _ocr_page_with_gemini(image_bytes: bytes) -> str:
+    """Send a page image to Gemini Vision and return extracted text."""
+    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[
+            google_types.Content(parts=[
+                google_types.Part(text=(
+                    "Extract ALL text from this image exactly as it appears. "
+                    "Preserve the structure: headings, bullet points, tables, numbered lists. "
+                    "Return only the extracted text — no commentary."
+                )),
+                google_types.Part(
+                    inline_data=google_types.Blob(mime_type="image/png", data=image_bytes)
+                ),
+            ])
+        ],
+    )
+    return response.text or ""
+
+
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
-        reader = PdfReader(tmp_path)
         pages = []
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text() or ""
-            if text.strip():
-                pages.append({"text": text, "page_number": i + 1})
+        with pdfplumber.open(tmp_path) as pdf:
+            total = len(pdf.pages)
+            logger.info(f"PDF has {total} pages")
+            ocr_count = 0
+
+            for i, page in enumerate(pdf.pages):
+                # --- attempt 1: pdfplumber direct extraction ---
+                text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+
+                # Append any tables as pipe-separated rows
+                for table in (page.extract_tables() or []):
+                    rows = [
+                        " | ".join(cell or "" for cell in row)
+                        for row in table if row
+                    ]
+                    if rows:
+                        text += "\n\nTable:\n" + "\n".join(rows)
+
+                text = clean_text(text)
+
+                # --- attempt 2: Gemini Vision OCR for image/scanned pages ---
+                if not text:
+                    try:
+                        logger.info(f"Page {i + 1}/{total}: no selectable text — running Gemini OCR")
+                        image_bytes = _render_page_as_png(tmp_path, i)
+                        text = clean_text(_ocr_page_with_gemini(image_bytes))
+                        if text:
+                            ocr_count += 1
+                    except Exception as e:
+                        logger.warning(f"Page {i + 1}/{total}: OCR failed — {e}")
+
+                if text:
+                    pages.append({"text": text, "page_number": i + 1})
+                else:
+                    logger.warning(f"Page {i + 1}/{total}: blank even after OCR, skipping")
+
+        logger.info(
+            f"Extracted {len(pages)}/{total} pages "
+            f"({len(pages) - ocr_count} direct + {ocr_count} via OCR)"
+        )
         return pages
     finally:
         os.unlink(tmp_path)
 
+
 def extract_text_from_txt(file_bytes: bytes) -> list[dict]:
-    return [{"text": file_bytes.decode("utf-8", errors="replace"), "page_number": 1}]
+    text = clean_text(file_bytes.decode("utf-8", errors="replace"))
+    return [{"text": text, "page_number": 1}] if text else []
+
 
 def chunk_document(pages: list[dict]) -> list[dict]:
     chunks = []
@@ -74,10 +169,11 @@ def chunk_document(pages: list[dict]) -> list[dict]:
         for chunk_text in text_splitter.split_text(page["text"]):
             chunks.append({
                 "text": chunk_text,
-                "metadata": {"page_number": page["page_number"], "chunk_index": chunk_index}
+                "metadata": {"page_number": page["page_number"], "chunk_index": chunk_index},
             })
             chunk_index += 1
     return chunks
+
 
 async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> dict:
     loop = asyncio.get_event_loop()
@@ -107,59 +203,90 @@ async def ingest_document(file_bytes: bytes, filename: str, file_type: str) -> d
     texts = [c["text"] for c in chunks]
     metadatas = [{**c["metadata"], "filename": filename, "document_id": document_id} for c in chunks]
 
-    qdrant_url = os.getenv("QDRANT_URL")
-    qdrant_api_key = os.getenv("QDRANT_API_KEY")
-    embeddings = get_embeddings()
+    embeddings = get_doc_embeddings()
+
+    EMBED_BATCH = 5  # small batches to stay within Gemini free-tier rate limits
 
     def _store_vectors():
-        QdrantVectorStore.from_texts(
-            texts=texts,
-            embedding=embeddings,
+        vector_store = QdrantVectorStore(
+            client=qdrant,
             collection_name=collection_name,
-            url=qdrant_url,
-            api_key=qdrant_api_key,
-            metadatas=metadatas,
+            embedding=embeddings,
         )
+        total = len(texts)
+        for start in range(0, total, EMBED_BATCH):
+            end = min(start + EMBED_BATCH, total)
+            batch_texts = texts[start:end]
+            batch_metas = metadatas[start:end]
+
+            for attempt in range(3):
+                try:
+                    vector_store.add_texts(texts=batch_texts, metadatas=batch_metas)
+                    logger.info(f"Embedded chunks {start + 1}–{end}/{total}")
+                    break
+                except Exception as e:
+                    wait = 10 * (attempt + 1)
+                    logger.warning(f"Batch {start}–{end} attempt {attempt + 1} failed ({e}), retrying in {wait}s")
+                    if attempt < 2:
+                        time.sleep(wait)
+                    else:
+                        raise
+
+            # brief pause between batches to respect Gemini RPM limits
+            if end < total:
+                time.sleep(1)
+
+        stored = qdrant.count(collection_name=collection_name).count
+        logger.info(f"Verified {stored} vectors in Qdrant (expected {total})")
 
     await loop.run_in_executor(None, _store_vectors)
 
-    logger.info(f"Ingestion complete: {document_id}, {len(chunks)} chunks, {len(pages)} pages")
+    stored_count = qdrant.count(collection_name=collection_name).count
+    logger.info(f"Ingestion complete: {document_id}, {stored_count}/{len(chunks)} chunks stored, {len(pages)} pages")
     return {
         "document_id": document_id,
         "collection_name": collection_name,
         "filename": filename,
-        "chunk_count": len(chunks),
+        "chunk_count": stored_count,
         "page_count": len(pages),
     }
 
-SYSTEM_PROMPT_TEMPLATE = """You are an intelligent AI assistant that answers questions strictly based on the provided document context.
 
-RULES:
-1. ONLY answer based on the provided context from the document.
-2. If the answer is not found in the context, say: "I couldn't find this information in the uploaded document."
-3. Always cite the page number(s) where you found the information.
-4. Be clear, concise, and well-structured in your responses.
-5. Use markdown formatting for better readability.
+SYSTEM_PROMPT_TEMPLATE = """You are an expert document analyst. Answer ONLY from the context provided below.
+
+FORMATTING RULES:
+- Use markdown formatting throughout: ## for headings, **bold** for key terms, bullet lists (-) for enumerations, numbered lists for steps
+- Keep each paragraph to 3-4 sentences maximum
+- Use code blocks (```) for any code, commands, or technical strings
+
+CITATION RULES:
+- Cite inline immediately after each fact, like this: **[Page 3]**
+- If a fact spans multiple pages, cite all of them: **[Page 3]** **[Page 7]**
+- At the end of your answer, add a "## Sources" section that lists every page you cited
 
 CONTEXT FROM DOCUMENT:
 {context}
+
+If the information is not present in the context above, respond with exactly:
+"I couldn't find this information in the uploaded document."
 """
+
 
 async def retrieve_and_generate(query: str, collection_name: str, stream: bool = True):
     vector_store = QdrantVectorStore.from_existing_collection(
-        embedding=get_embeddings(),
+        embedding=get_query_embeddings(),
         collection_name=collection_name,
         url=os.getenv("QDRANT_URL"),
         api_key=os.getenv("QDRANT_API_KEY"),
     )
 
     results = vector_store.similarity_search_with_score(query, k=TOP_K)
-    
+
     context_parts = []
     sources = []
     for doc, score in results:
         page_num = doc.metadata.get("page_number", "?")
-        context_parts.append(f"[Page {page_num}] {doc.page_content}")
+        context_parts.append(f"[Page {page_num}]\n{doc.page_content}")
         sources.append({
             "page_number": page_num,
             "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
@@ -173,13 +300,15 @@ async def retrieve_and_generate(query: str, collection_name: str, stream: bool =
 
     if stream:
         async def generate():
+            # First line: sources metadata
+            yield json.dumps({"t": "sources", "d": sources}) + "\n"
             try:
                 async for chunk in get_llm(stream=True).astream(messages):
                     if chunk.content:
-                        yield chunk.content
+                        yield json.dumps({"t": "chunk", "d": chunk.content}) + "\n"
             except Exception as e:
                 logger.error(f"LLM streaming error: {e}", exc_info=True)
-                yield f"\n\n[Error generating response: {str(e)}]"
+                yield json.dumps({"t": "error", "d": str(e)}) + "\n"
         return generate, sources
 
     try:
@@ -187,4 +316,4 @@ async def retrieve_and_generate(query: str, collection_name: str, stream: bool =
         return response.content, sources
     except Exception as e:
         logger.error(f"LLM invocation error: {e}", exc_info=True)
-        raise e
+        raise
