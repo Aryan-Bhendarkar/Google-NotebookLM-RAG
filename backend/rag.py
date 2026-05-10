@@ -24,12 +24,22 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 400
-EMBEDDING_MODEL = "models/gemini-embedding-2"
-EMBEDDING_DIMENSIONS = 3072
+EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_DIMENSIONS = 768
 LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 TOP_K = 10
 EMBED_BATCH = 5
+
+# Single shared client — avoids re-creating connection pools on every call
+_gemini_client: google_genai.Client | None = None
+
+
+def get_gemini_client() -> google_genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
+    return _gemini_client
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -37,8 +47,7 @@ def get_qdrant_client() -> QdrantClient:
 
 
 def embed_texts(texts: list[str], task_type: str) -> list[list[float]]:
-    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
-    response = client.models.embed_content(
+    response = get_gemini_client().models.embed_content(
         model=EMBEDDING_MODEL,
         contents=texts,
         config=google_types.EmbedContentConfig(task_type=task_type),
@@ -85,8 +94,7 @@ def _render_page_as_png(pdf_path: str, page_index: int) -> bytes:
 
 
 def _ocr_page_with_gemini(image_bytes: bytes) -> str:
-    client = google_genai.Client(api_key=os.getenv("GOOGLE_API_KEY") or "")
-    response = client.models.generate_content(
+    response = get_gemini_client().models.generate_content(
         model="gemini-2.0-flash",
         contents=[
             google_types.Content(parts=[

@@ -11,6 +11,7 @@ interface FileUploadProps {
 
 export function FileUpload({ onUploadSuccess }: FileUploadProps) {
   const [isUploading, setIsUploading] = useState(false);
+  const [status, setStatus] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
@@ -19,12 +20,27 @@ export function FileUpload({ onUploadSuccess }: FileUploadProps) {
 
     setIsUploading(true);
     setError(null);
+    const base = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+
+    // Warm up the server — Render free tier sleeps after 15 min of inactivity.
+    // Ping the health endpoint first; if it fails, wait and retry once.
+    try {
+      setStatus("Connecting to server...");
+      const warm = await fetch(`${base}/`, { method: "GET" }).catch(() => null);
+      if (!warm?.ok) {
+        setStatus("Server is waking up, please wait...");
+        await new Promise(r => setTimeout(r, 15000));
+        await fetch(`${base}/`, { method: "GET" }).catch(() => null);
+      }
+    } catch {
+      // best-effort warmup — proceed anyway
+    }
 
     const formData = new FormData();
     formData.append("file", file);
 
     try {
-      const base = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+      setStatus("Processing document...");
       const response = await fetch(`${base}/upload`, {
         method: "POST",
         body: formData,
@@ -37,7 +53,7 @@ export function FileUpload({ onUploadSuccess }: FileUploadProps) {
 
       const data = await response.json();
       onUploadSuccess(data.document_id, data.collection_name, data.filename);
-      
+
     } catch (err: unknown) {
       if (err instanceof Error) {
         setError(err.message || "An unexpected error occurred.");
@@ -46,6 +62,7 @@ export function FileUpload({ onUploadSuccess }: FileUploadProps) {
       }
     } finally {
       setIsUploading(false);
+      setStatus("");
     }
   }, [onUploadSuccess]);
 
@@ -108,8 +125,8 @@ export function FileUpload({ onUploadSuccess }: FileUploadProps) {
           <div className="text-center space-y-2">
             {isUploading ? (
               <>
-                <p className="text-lg font-medium text-white/90">Processing...</p>
-                <p className="text-sm text-white/40 animate-pulse">Running chunking & embeddings.</p>
+                <p className="text-lg font-medium text-white/90">{status || "Processing..."}</p>
+                <p className="text-sm text-white/40 animate-pulse">Running chunking &amp; embeddings.</p>
               </>
             ) : (
               <>
