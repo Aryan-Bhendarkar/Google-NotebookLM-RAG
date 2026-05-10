@@ -2,6 +2,8 @@
 
 A RAG web app — upload a PDF or TXT document and chat with it using AI. Built on free-tier services.
 
+**Live demo:** [google-notebooklm-rag-blue.vercel.app](https://google-notebooklm-rag-blue.vercel.app)
+
 ## Tech Stack
 
 | Layer      | Technology                                           |
